@@ -214,7 +214,7 @@ def hand_back_to_invoking_user(path):
     if uid and gid:
         try:
             os.chown(path, int(uid), int(gid))
-        except OSError:
+        except (OSError, ValueError):
             pass
 
 
