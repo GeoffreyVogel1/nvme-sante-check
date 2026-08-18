@@ -26,7 +26,7 @@ import subprocess
 import sys
 import time
 import argparse
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # ============================================================
 #  DECISION THRESHOLDS (everything explicit, tune them here)
@@ -79,6 +79,8 @@ def smartctl_json(args):
 
 
 def human_bytes(o):
+    if o < 1e12:
+        return f"{o/1e9:.0f} GB"
     return f"{o/1e12:.2f} TB ({o/1e9:.0f} GB)"
 
 
@@ -190,6 +192,9 @@ def manufacturer(model):
     for key, name in MANUFACTURERS.items():
         if key in m:
             return name
+    # Crucial SKUs (e.g. CT1000P3SSD8) don't contain "crucial"/"micron" as text.
+    if m.startswith("ct") and len(m) > 2 and m[2].isdigit():
+        return "Crucial (Micron)"
     return None
 
 
@@ -202,7 +207,7 @@ def report_filename(name, serial):
 
 def write_report(name, resolved_type, model, serial, capacity, passed, temp_c, bytes_read, bytes_written,
                   used, avail, thresh, power_cycles, poh, days, unsafe, media, errlog,
-                  stop, watch, estimated_start, mfr):
+                  stop, watch, mfr):
     path = report_filename(name, serial)
     lines = [
         f"NVMe health report — {name}",
@@ -216,7 +221,7 @@ def write_report(name, resolved_type, model, serial, capacity, passed, temp_c, b
     if resolved_type != "nvme":
         lines.append(f"Accessed via USB bridge: {resolved_type}")
     if capacity:
-        lines.append(f"Reported capacity: {capacity/1e12:.2f} TB ({capacity/1e9:.0f} GB)")
+        lines.append(f"Reported capacity: {human_bytes(capacity)}")
     if passed is not None:
         lines.append(f"Manufacturer SMART verdict: {'PASSED' if passed else 'FAILED'}")
     lines += [
@@ -224,10 +229,8 @@ def write_report(name, resolved_type, model, serial, capacity, passed, temp_c, b
         f"Total read    : {human_bytes(bytes_read)}",
         f"Total written : {human_bytes(bytes_written)}",
         f"Wear (spec) : {used}%   |   Spare : {avail}% (threshold {thresh}%)",
-        f"Power cycles: {power_cycles}   |   Powered on: {poh} h (~{days:.1f} d)",
+        f"Power cycles: {power_cycles}   |   Powered on: {poh} h (~{days:.1f} d, minimum age — real calendar age may be higher)",
         f"Unsafe shutdowns: {unsafe}   |   Media errors: {media}   |   Error log entries: {errlog}",
-        f"Estimated in-service date: ~{estimated_start} "
-        "(estimated from power-on hours, assuming continuous use — not a manufacturing date)",
         "",
     ]
     if stop:
@@ -285,24 +288,21 @@ def health(name, dtype, run_test=False, run_eject=False, write_report_file=False
     bytes_read, bytes_written = dread * 512000, dwrite * 512000
     written_tb = bytes_written / 1e12
     days = poh / 24
-    estimated_start = (datetime.now() - timedelta(hours=poh)).strftime("%Y-%m-%d") if poh else "unknown"
 
     info(f"Model : {model}   |   Serial : {serial}")
     mfr = manufacturer(model)
     if mfr:
         info(f"Detected manufacturer: {mfr}  (check warranty/authenticity with this serial number on the official {mfr} site)")
     if capacity:
-        info(f"Reported capacity: {capacity/1e12:.2f} TB ({capacity/1e9:.0f} GB)")
+        info(f"Reported capacity: {human_bytes(capacity)}")
     if passed is not None:
         info(f"Manufacturer SMART verdict: {'PASSED' if passed else 'FAILED'}")
     info(f"Temperature     : {temp_c} °C")
     info(f"Total read      : {human_bytes(bytes_read)}")
     info(f"Total written   : {human_bytes(bytes_written)}")
     info(f"Wear (spec)     : {used}%   |   Spare : {avail}% (threshold {thresh}%)")
-    info(f"Power cycles    : {power_cycles}   |   Powered on : {poh} h (~{days:.1f} d)")
+    info(f"Power cycles    : {power_cycles}   |   Powered on : {poh} h (~{days:.1f} d, minimum age — real calendar age may be higher)")
     info(f"Unsafe shutdowns: {unsafe}   |   Media errors : {media}   |   Error log : {errlog}")
-    info(f"Estimated in-service date: ~{estimated_start}  "
-         "(estimated from power-on hours, assuming continuous use — not a manufacturing date)")
 
     stop, watch = [], []
     if passed is False:                        stop.append("manufacturer SMART verdict = FAILED")
@@ -340,7 +340,7 @@ def health(name, dtype, run_test=False, run_eject=False, write_report_file=False
     if write_report_file:
         write_report(name, resolved_type, model, serial, capacity, passed, temp_c, bytes_read, bytes_written,
                       used, avail, thresh, power_cycles, poh, days, unsafe, media, errlog,
-                      stop, watch, estimated_start, mfr)
+                      stop, watch, mfr)
 
     if run_eject:
         eject(name, resolved_type)
@@ -361,7 +361,7 @@ def watch_loop(run_test, write_report_file):
                 health(name, dtype, run_test, True, write_report_file)
                 known.add(name)
                 heading("Waiting for the next NVMe drive...")
-            time.sleep(2)
+            time.sleep(5)
     except KeyboardInterrupt:
         print()
         info("Watch mode stopped.")
@@ -382,6 +382,8 @@ def main():
     ap.add_argument("-w", "--watch", action="store_true",
                     help="Continuous watch mode: reads then automatically ejects each inserted USB NVMe drive "
                          "(handy for testing several drives via one enclosure). Ctrl+C to stop.")
+    ap.add_argument("--once", action="store_true",
+                    help="Scan every currently attached NVMe drive once and exit (no watch loop, no auto-eject).")
     args = ap.parse_args()
 
     if len(sys.argv) == 1:
