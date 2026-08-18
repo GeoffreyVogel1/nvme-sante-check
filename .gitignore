@@ -1,0 +1,5 @@
+nvme-health_*.txt
+nvme-sante*.py
+nvme-sante*.desktop
+__pycache__/
+*.pyc
