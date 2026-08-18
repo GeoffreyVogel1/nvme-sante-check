@@ -205,6 +205,19 @@ def report_filename(name, serial):
     return f"nvme-health_{base}_{timestamp}.txt"
 
 
+def hand_back_to_invoking_user(path):
+    """When run via sudo, the report would otherwise end up owned by root,
+    which regular file managers refuse to let the real user delete."""
+    if os.name == "nt" or os.geteuid() != 0:
+        return
+    uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
+    if uid and gid:
+        try:
+            os.chown(path, int(uid), int(gid))
+        except OSError:
+            pass
+
+
 def write_report(name, resolved_type, model, serial, capacity, passed, temp_c, bytes_read, bytes_written,
                   used, avail, thresh, power_cycles, poh, days, unsafe, media, errlog,
                   stop, watch, mfr):
@@ -247,6 +260,7 @@ def write_report(name, resolved_type, model, serial, capacity, passed, temp_c, b
     try:
         with open(path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
+        hand_back_to_invoking_user(path)
         ok(f"Report written: {path}")
     except OSError as e:
         err(f"Could not write report: {e}")
