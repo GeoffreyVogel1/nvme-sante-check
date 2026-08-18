@@ -390,6 +390,9 @@ def main():
         # Run with no arguments: go straight to USB watch mode + report (primary use case).
         args.watch = True
         args.out = True
+    # args.once has no dedicated branch below: it's a sentinel. Passing it (or any other
+    # flag) already skips the auto-watch default above and falls through to the one-shot
+    # scan-every-attached-drive branch further down.
 
     if not shutil.which("smartctl"):
         err("smartmontools is not installed. See the script header.")
