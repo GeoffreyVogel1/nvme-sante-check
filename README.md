@@ -21,6 +21,11 @@ never touches the drive's data.
 - **Watch mode**: insert a drive into a USB enclosure, it gets read (and
   reported / ejected) automatically, in a loop — handy for testing several
   second-hand drives back to back.
+- After testing 2+ drives in one run (watch mode, or a scan covering
+  several drives), prints a **ranking** from best to worst (verdict first,
+  wear % as tiebreaker) so you can see at a glance which one to keep.
+- **Interactive menu** (`-m`/`--menu`): pick local vs USB drives, and single
+  pass vs continuous watch, without remembering any flags.
 
 ## Install
 
@@ -55,6 +60,12 @@ sudo ./nvme-health.py -d /dev/sda --type sntjmicron
 
 # Only show drives behind a USB bridge
 sudo ./nvme-health.py -u
+
+# Only show local/native NVMe drives (ignore USB enclosures)
+sudo ./nvme-health.py -l
+
+# Interactive menu: local vs USB, single pass vs continuous watch
+sudo ./nvme-health.py -m
 
 # Run the built-in short self-test too
 sudo ./nvme-health.py -t

@@ -84,7 +84,7 @@ def human_bytes(o):
     return f"{o/1e12:.2f} TB ({o/1e9:.0f} GB)"
 
 
-def detect(usb_only=False):
+def detect(usb_only=False, local_only=False):
     """`smartctl --scan-open`: opens devices to identify USB bridges."""
     data = smartctl_json(["--scan-open"])
     res = []
@@ -96,6 +96,8 @@ def detect(usb_only=False):
         proto = (d.get("protocol") or "").lower()
         is_usb = typ.startswith("snt")
         if usb_only and not is_usb:
+            continue
+        if local_only and is_usb:
             continue
         if "nvme" in proto or "nvme" in typ or is_usb:
             res.append((name, d.get("type", "nvme")))
@@ -338,13 +340,16 @@ def health(name, dtype, run_test=False, run_eject=False, write_report_file=False
 
     print()
     if stop:
+        verdict = "RUN AWAY"
         print(f"{R}{BOLD}  VERDICT: RUN AWAY{Z}")
         for x in stop:  print(f"   {R}- {x}{Z}")
         for x in watch: print(f"   {Y}· {x}{Z}")
     elif watch:
+        verdict = "WATCH"
         print(f"{Y}{BOLD}  VERDICT: KEEP AN EYE ON IT{Z}")
         for x in watch: print(f"   {Y}· {x}{Z}")
     else:
+        verdict = "GOOD"
         print(f"{G_}{BOLD}  VERDICT: GOOD{Z}")
         ok("no warning signs, counters consistent")
 
@@ -359,11 +364,34 @@ def health(name, dtype, run_test=False, run_eject=False, write_report_file=False
     if run_eject:
         eject(name, resolved_type)
 
+    return {"name": name, "model": model, "serial": serial, "verdict": verdict,
+            "used": used, "poh": poh, "mfr": mfr}
+
+
+VERDICT_RANK = {"GOOD": 0, "WATCH": 1, "RUN AWAY": 2}
+VERDICT_COLOR = {"GOOD": G_, "WATCH": Y, "RUN AWAY": R}
+
+
+def print_ranking(results):
+    """Prints tested drives from best to worst. No-op for fewer than 2 drives."""
+    if len(results) < 2:
+        return
+    ranked = sorted(results, key=lambda r: (VERDICT_RANK[r["verdict"]], r["used"], r["poh"]))
+    heading(f"Ranking — {len(ranked)} drive(s) tested, best first:")
+    for i, r in enumerate(ranked, 1):
+        c = VERDICT_COLOR[r["verdict"]]
+        mfr = r["mfr"]
+        primary = mfr.split(" (")[0] if mfr else ""
+        label = r["model"] if not mfr or r["model"].lower().startswith(primary.lower()) else f"{mfr} {r['model']}"
+        print(f"  {i}. {label} (S/N {r['serial']}) — {c}{r['verdict']}{Z} "
+              f"— wear {r['used']}%, {r['poh']} h on")
+
 
 def watch_loop(run_test, write_report_file):
     """Loop: detects each newly inserted USB NVMe drive, reads it, then ejects it automatically."""
     heading("USB watch mode — insert a NVMe drive, it will be read then ejected automatically (Ctrl+C to stop).")
     known = set()
+    results = []
     try:
         while True:
             targets = detect(usb_only=True)
@@ -372,13 +400,37 @@ def watch_loop(run_test, write_report_file):
             for name, dtype in targets:
                 if name in known:
                     continue
-                health(name, dtype, run_test, True, write_report_file)
+                result = health(name, dtype, run_test, True, write_report_file)
+                if result:
+                    results.append(result)
                 known.add(name)
                 heading("Waiting for the next NVMe drive...")
             time.sleep(5)
     except KeyboardInterrupt:
         print()
         info("Watch mode stopped.")
+        print_ranking(results)
+
+
+def interactive_menu():
+    """Asks where to look and how, for --menu / double-click use. Returns (usb_only, local_only, watch)."""
+    heading("NVMe Health Check")
+    print("Where are the drives you want to test?")
+    print("  1) Local drives (motherboard / internal)")
+    print("  2) USB drives")
+    choice = input("> ").strip()
+    usb_only = choice == "2"
+    local_only = choice == "1"
+
+    watch = False
+    if usb_only:
+        print()
+        print("Test mode?")
+        print("  1) Single pass (test what's connected now, then exit)")
+        print("  2) Continuous (insert/remove drives, tested automatically in a loop)")
+        watch = input("> ").strip() == "2"
+
+    return usb_only, local_only, watch
 
 
 def main():
@@ -393,20 +445,31 @@ def main():
                     help="Write a .txt report per drive (nvme-health_<serial>_<timestamp>.txt, current directory).")
     ap.add_argument("-u", "--usb-only", action="store_true",
                     help="Only show/process NVMe drives behind a USB bridge (ignore native NVMe drives).")
+    ap.add_argument("-l", "--local-only", action="store_true",
+                    help="Only show/process native NVMe drives (ignore USB-attached ones).")
     ap.add_argument("-w", "--watch", action="store_true",
                     help="Continuous watch mode: reads then automatically ejects each inserted USB NVMe drive "
                          "(handy for testing several drives via one enclosure). Ctrl+C to stop.")
     ap.add_argument("--once", action="store_true",
                     help="Scan every currently attached NVMe drive once and exit (no watch loop, no auto-eject).")
+    ap.add_argument("-m", "--menu", action="store_true",
+                    help="Interactive menu: choose local vs USB drives, and single pass vs continuous watch.")
     args = ap.parse_args()
 
-    if len(sys.argv) == 1:
+    if args.menu:
+        args.usb_only, args.local_only, args.watch = interactive_menu()
+        args.out = True
+    elif len(sys.argv) == 1:
         # Run with no arguments: go straight to USB watch mode + report (primary use case).
         args.watch = True
         args.out = True
     # args.once has no dedicated branch below: it's a sentinel. Passing it (or any other
     # flag) already skips the auto-watch default above and falls through to the one-shot
     # scan-every-attached-drive branch further down.
+
+    if args.usb_only and args.local_only:
+        err("--usb-only and --local-only are mutually exclusive.")
+        sys.exit(1)
 
     if not shutil.which("smartctl"):
         err("smartmontools is not installed. See the script header.")
@@ -417,9 +480,9 @@ def main():
     elif args.device:
         health(args.device, args.type, args.test, args.eject, args.out)
     else:
-        targets = detect(args.usb_only)
+        targets = detect(args.usb_only, args.local_only)
         if not targets:
-            what = "USB NVMe drive" if args.usb_only else "NVMe drive"
+            what = "USB NVMe drive" if args.usb_only else ("local NVMe drive" if args.local_only else "NVMe drive")
             err(f"No {what} detected by `smartctl --scan-open`.")
             info("USB enclosure? Find the drive then force it:")
             info("   Linux  : lsblk        (it will show as /dev/sdX)")
@@ -427,8 +490,12 @@ def main():
             info("   Windows: wmic diskdrive list brief")
             info("Then:  sudo python3 nvme-health.py -d /dev/sdX   ('auto' type tries the bridges)")
             sys.exit(1)
+        results = []
         for name, dtype in targets:
-            health(name, dtype, args.test, args.eject, args.out)
+            result = health(name, dtype, args.test, args.eject, args.out)
+            if result:
+                results.append(result)
+        print_ranking(results)
 
     heading("Done.")
 
