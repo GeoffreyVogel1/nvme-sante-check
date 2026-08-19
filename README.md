@@ -67,6 +67,9 @@ sudo ./nvme-health.py -l
 # Interactive menu: local vs USB, single pass vs continuous watch
 sudo ./nvme-health.py -m
 
+# Try the ranking feature on 3 made-up drives — no sudo, no real hardware needed
+./nvme-health.py --demo
+
 # Run the built-in short self-test too
 sudo ./nvme-health.py -t
 

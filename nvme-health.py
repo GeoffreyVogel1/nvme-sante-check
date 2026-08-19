@@ -178,7 +178,9 @@ def eject(name, resolved_type):
 
 
 MANUFACTURERS = {
-    "samsung": "Samsung", "western digital": "Western Digital", "wd_": "Western Digital",
+    "samsung": "Samsung", "western digital": "Western Digital",
+    "wd blue": "Western Digital", "wd black": "Western Digital", "wd green": "Western Digital",
+    "wds": "Western Digital",
     "sandisk": "SanDisk", "crucial": "Crucial (Micron)", "micron": "Micron",
     "kingston": "Kingston", "sk hynix": "SK hynix", "hynix": "SK hynix",
     "seagate": "Seagate", "corsair": "Corsair", "xpg": "ADATA (XPG)", "adata": "ADATA",
@@ -278,7 +280,12 @@ def health(name, dtype, run_test=False, run_eject=False, write_report_file=False
         info("Identify the enclosure's bridge chip: `lsusb` (Linux). Then force the type, e.g.:")
         info(f"   sudo python3 {os.path.basename(__file__)} -d {name} --type sntjmicron")
         info("Possible types: sntjmicron, sntrealtek, sntasmedia.")
-        return
+        return None
+    return process_health(name, resolved_type, data, run_test, run_eject, write_report_file)
+
+
+def process_health(name, resolved_type, data, run_test=False, run_eject=False, write_report_file=False):
+    """Formats/evaluates already-fetched SMART data. Shared by health() and demo mode."""
     if resolved_type != "nvme":
         info(f"USB bridge detected: accessed via type '{resolved_type}'.")
 
@@ -387,6 +394,45 @@ def print_ranking(results):
               f"— wear {r['used']}%, {r['poh']} h on")
 
 
+DEMO_DRIVES = [
+    ("/dev/demo0", "Samsung 970 EVO Plus", "DEMO-0001", 1_000_204_886_016, True, dict(
+        percentage_used=8, temperature=38, available_spare=100, available_spare_threshold=10,
+        data_units_read=90_000_000, data_units_written=60_000_000, power_cycles=120,
+        power_on_hours=4000, unsafe_shutdowns=2, media_errors=0, num_err_log_entries=0,
+        critical_warning=0)),
+    ("/dev/demo1", "CT1000P3SSD8", "DEMO-0002", 1_000_204_886_016, True, dict(
+        percentage_used=75, temperature=45, available_spare=40, available_spare_threshold=10,
+        data_units_read=400_000_000, data_units_written=350_000_000, power_cycles=900,
+        power_on_hours=22000, unsafe_shutdowns=180, media_errors=0, num_err_log_entries=2,
+        critical_warning=0)),
+    ("/dev/demo2", "WD Blue SN570", "DEMO-0003", 500_107_862_016, False, dict(
+        percentage_used=100, temperature=55, available_spare=5, available_spare_threshold=10,
+        data_units_read=800_000_000, data_units_written=700_000_000, power_cycles=3000,
+        power_on_hours=40000, unsafe_shutdowns=500, media_errors=12, num_err_log_entries=40,
+        critical_warning=1)),
+]
+
+
+def run_demo(write_report_file):
+    """Runs the full pipeline (format, verdict, ranking) on made-up drives — no hardware,
+    no smartctl, no root needed. For trying out the ranking feature without several NVMes."""
+    heading("Demo mode — synthetic data, no real drive is touched.")
+    results = []
+    for name, model, serial, capacity, passed, log in DEMO_DRIVES:
+        heading(f"Health: {name} (demo)")
+        data = {
+            "model_name": model,
+            "serial_number": serial,
+            "nvme_total_capacity": capacity,
+            "smart_status": {"passed": passed},
+            "nvme_smart_health_information_log": log,
+        }
+        result = process_health(name, "nvme", data, False, False, write_report_file)
+        if result:
+            results.append(result)
+    print_ranking(results)
+
+
 def watch_loop(run_test, write_report_file):
     """Loop: detects each newly inserted USB NVMe drive, reads it, then ejects it automatically."""
     heading("USB watch mode — insert a NVMe drive, it will be read then ejected automatically (Ctrl+C to stop).")
@@ -454,7 +500,15 @@ def main():
                     help="Scan every currently attached NVMe drive once and exit (no watch loop, no auto-eject).")
     ap.add_argument("-m", "--menu", action="store_true",
                     help="Interactive menu: choose local vs USB drives, and single pass vs continuous watch.")
+    ap.add_argument("--demo", action="store_true",
+                    help="Run the ranking/report pipeline on 3 made-up drives — no smartctl, no root, "
+                         "no real hardware needed. For trying the ranking feature with only one real drive.")
     args = ap.parse_args()
+
+    if args.demo:
+        run_demo(args.out)
+        heading("Done.")
+        return
 
     if args.menu:
         args.usb_only, args.local_only, args.watch = interactive_menu()
