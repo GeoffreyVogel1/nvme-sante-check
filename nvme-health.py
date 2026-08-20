@@ -78,6 +78,15 @@ def smartctl_json(args):
         return {}
 
 
+def smart_num(log, key, default=0):
+    """Returns log[key] only if it's already a real number; falls back to `default`
+    both for a missing key and for a present-but-non-numeric value (some USB bridges
+    emit unreliable JSON typing for a few fields, which would otherwise crash the
+    numeric comparisons below)."""
+    v = log.get(key, default)
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else default
+
+
 def human_bytes(o):
     if o < 1e12:
         return f"{o/1e9:.0f} GB"
@@ -112,6 +121,13 @@ def read_health(name, dtype):
         if data.get("nvme_smart_health_information_log"):
             return data, t
     return None, None
+
+
+def quick_serial(name, dtype):
+    """Cheap identify-only probe (no full SMART log) used by watch mode to tell
+    whether the drive now sitting at `name` is still the one last processed there,
+    or whether the OS reused that device path for a different physical drive."""
+    return smartctl_json(["-i", "-d", dtype, name]).get("serial_number")
 
 
 def short_test(name, dtype):
@@ -209,15 +225,17 @@ def report_filename(name, serial):
     return f"nvme-health_{base}_{timestamp}.txt"
 
 
-def hand_back_to_invoking_user(path):
+def hand_back_to_invoking_user(fd):
     """When run via sudo, the report would otherwise end up owned by root,
-    which regular file managers refuse to let the real user delete."""
+    which regular file managers refuse to let the real user delete. Chowns via the
+    already-open file descriptor (not the path) so a symlink swapped in after the
+    file was created can't redirect ownership onto an unrelated file."""
     if os.name == "nt" or os.geteuid() != 0:
         return
     uid, gid = os.environ.get("SUDO_UID"), os.environ.get("SUDO_GID")
     if uid and gid:
         try:
-            os.chown(path, int(uid), int(gid))
+            os.fchown(fd, int(uid), int(gid))
         except (OSError, ValueError):
             pass
 
@@ -261,11 +279,18 @@ def write_report(name, resolved_type, model, serial, capacity, passed, temp_c, b
         lines.append("VERDICT: GOOD")
         lines.append("  no warning signs, counters consistent")
 
+    # O_EXCL (+ O_NOFOLLOW where available) makes creation atomic: it fails outright
+    # if `path` already exists, whether as a regular file or a pre-planted symlink,
+    # instead of silently writing through a symlink to an arbitrary target.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
     try:
-        with open(path, "w", encoding="utf-8") as f:
+        fd = os.open(path, flags, 0o644)
+        hand_back_to_invoking_user(fd)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
-        hand_back_to_invoking_user(path)
         ok(f"Report written: {path}")
+    except FileExistsError:
+        err(f"Could not write report: {path} already exists.")
     except OSError as e:
         err(f"Could not write report: {e}")
 
@@ -295,18 +320,23 @@ def process_health(name, resolved_type, data, run_test=False, run_eject=False, w
     capacity = data.get("nvme_total_capacity") or data.get("user_capacity", {}).get("bytes", 0)
     passed  = data.get("smart_status", {}).get("passed", None)
 
-    crit    = log.get("critical_warning", 0)
-    temp_c  = log.get("temperature", 0)
-    avail   = log.get("available_spare", 100)
-    thresh  = log.get("available_spare_threshold", 0)
-    used    = log.get("percentage_used", 0)
-    dread   = log.get("data_units_read", 0)
-    dwrite  = log.get("data_units_written", 0)
-    power_cycles = log.get("power_cycles", 0)
-    poh     = log.get("power_on_hours", 0)
-    unsafe  = log.get("unsafe_shutdowns", 0)
-    media   = log.get("media_errors", 0)
-    errlog  = log.get("num_err_log_entries", 0)
+    crit    = smart_num(log, "critical_warning", 0)
+    temp_c  = smart_num(log, "temperature", 0)
+    avail   = smart_num(log, "available_spare", 100)
+    thresh  = smart_num(log, "available_spare_threshold", 0)
+    used    = smart_num(log, "percentage_used", 0)
+    dread   = smart_num(log, "data_units_read", 0)
+    dwrite  = smart_num(log, "data_units_written", 0)
+    power_cycles = smart_num(log, "power_cycles", 0)
+    poh     = smart_num(log, "power_on_hours", 0)
+    unsafe  = smart_num(log, "unsafe_shutdowns", 0)
+    media   = smart_num(log, "media_errors", 0)
+    errlog  = smart_num(log, "num_err_log_entries", 0)
+
+    # A USB bridge can return a valid (non-empty) SMART log that's still missing the
+    # wear-related fields — silently defaulting those to "0% used / 100% spare" would
+    # print a false "GOOD" for a drive whose real wear is simply unknown.
+    missing_wear_fields = [k for k in ("available_spare", "percentage_used") if k not in log]
 
     bytes_read, bytes_written = dread * 512000, dwrite * 512000
     written_tb = bytes_written / 1e12
@@ -344,6 +374,10 @@ def process_health(name, resolved_type, data, run_test=False, run_eject=False, w
         watch.append(f"0% wear but {written_tb:.1f} TB written -> counter possibly reset")
     if poh < 50 and written_tb > INCONSISTENCY_TB_THRESHOLD:
         watch.append(f"only {poh} h powered on but {written_tb:.1f} TB written -> inconsistent")
+
+    if missing_wear_fields:
+        watch.append(f"drive/bridge didn't report {', '.join(missing_wear_fields)} "
+                      f"-> wear data incomplete, verdict may be unreliable")
 
     print()
     if stop:
@@ -436,20 +470,27 @@ def run_demo(write_report_file):
 def watch_loop(run_test, write_report_file):
     """Loop: detects each newly inserted USB NVMe drive, reads it, then ejects it automatically."""
     heading("USB watch mode — insert a NVMe drive, it will be read then ejected automatically (Ctrl+C to stop).")
-    known = set()
+    known = {}  # name -> (dtype, serial) of the drive last successfully processed at that path
     results = []
     try:
         while True:
             targets = detect(usb_only=True)
             present = {name for name, _ in targets}
-            known &= present  # forget drives unplugged since the last pass
+            known = {name: v for name, v in known.items() if name in present}  # forget drives unplugged since the last pass
             for name, dtype in targets:
                 if name in known:
-                    continue
+                    prev_dtype, prev_serial = known[name]
+                    # The OS can reuse a device path within one poll interval if the
+                    # known drive is swapped for another one; a cheap identify-only
+                    # probe catches that instead of trusting the path alone.
+                    if quick_serial(name, prev_dtype) == prev_serial:
+                        continue  # same drive still sitting there, already processed
+                    del known[name]  # different (or unverifiable) drive now at this path -> reprocess
                 result = health(name, dtype, run_test, True, write_report_file)
                 if result:
                     results.append(result)
-                known.add(name)
+                    known[name] = (dtype, result["serial"])
+                # a failed read is deliberately NOT marked known, so it's retried next pass
                 heading("Waiting for the next NVMe drive...")
             time.sleep(5)
     except KeyboardInterrupt:
@@ -495,9 +536,11 @@ def main():
                     help="Only show/process native NVMe drives (ignore USB-attached ones).")
     ap.add_argument("-w", "--watch", action="store_true",
                     help="Continuous watch mode: reads then automatically ejects each inserted USB NVMe drive "
-                         "(handy for testing several drives via one enclosure). Ctrl+C to stop.")
+                         "(handy for testing several drives via one enclosure). USB-only: not combinable with "
+                         "-d/--device or -l/--local-only. Ctrl+C to stop.")
     ap.add_argument("--once", action="store_true",
-                    help="Scan every currently attached NVMe drive once and exit (no watch loop, no auto-eject).")
+                    help="Scan every currently attached NVMe drive once and exit. Not combinable with "
+                         "-w/--watch or -e/--eject (both mean more than a single read-only pass).")
     ap.add_argument("-m", "--menu", action="store_true",
                     help="Interactive menu: choose local vs USB drives, and single pass vs continuous watch.")
     ap.add_argument("--demo", action="store_true",
@@ -513,6 +556,7 @@ def main():
     if args.menu:
         args.usb_only, args.local_only, args.watch = interactive_menu()
         args.out = True
+        info("A .txt report will be written for each drive tested (current directory).")
     elif len(sys.argv) == 1:
         # Run with no arguments: go straight to USB watch mode + report (primary use case).
         args.watch = True
@@ -525,14 +569,30 @@ def main():
         err("--usb-only and --local-only are mutually exclusive.")
         sys.exit(1)
 
+    if args.once and args.watch:
+        err("--once and -w/--watch are mutually exclusive (--once means a single pass, no loop).")
+        sys.exit(1)
+
+    if args.once and args.eject:
+        err("--once and -e/--eject are mutually exclusive (--once never touches the drive after reading it).")
+        sys.exit(1)
+
+    if args.watch and (args.device or args.local_only):
+        err("-w/--watch is USB-only: it watches for newly inserted drives, so it doesn't support "
+            "-d/--device or -l/--local-only.")
+        sys.exit(1)
+
     if not shutil.which("smartctl"):
         err("smartmontools is not installed. See the script header.")
         sys.exit(1)
 
+    failures = False
+
     if args.watch:
         watch_loop(args.test, args.out)
     elif args.device:
-        health(args.device, args.type, args.test, args.eject, args.out)
+        if not health(args.device, args.type, args.test, args.eject, args.out):
+            failures = True
     else:
         targets = detect(args.usb_only, args.local_only)
         if not targets:
@@ -549,9 +609,13 @@ def main():
             result = health(name, dtype, args.test, args.eject, args.out)
             if result:
                 results.append(result)
+            else:
+                failures = True
         print_ranking(results)
 
     heading("Done.")
+    if failures:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
